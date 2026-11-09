@@ -1,0 +1,2 @@
+"selected_feature_set","weighted","n_development","n_test","overall_accuracy_pct","balanced_accuracy_pct","macro_f1_pct","mtry","min.node.size","sample.fraction","splitrule"
+"spectral_terrain",TRUE,1329,367,65.9400544959128,63.336743248833,63.1704026615033,22,10,0.8,"extratrees"

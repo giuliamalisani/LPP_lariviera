@@ -1,0 +1,569 @@
+---
+title: "From satellite images to land-cover futures"
+subtitle: "Landscape change and remote sensing"
+author: "Dirk N. Karger"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+How can we describe a landscape, evaluate our interpretation and explore how it could develop? In this practical, you work through three approaches using the 20 x 20 km Bregaglia study area supplied as a GeoPackage.
+
+First, interpret two satellite images by eye. Then use reference observations to train and test a Random Forest that maps land cover in 2025. Finally, explore SSP-CH scenarios and quantify how two possible futures differ.
+
+By the end, you should be able to
+
+-   explain why a visible difference between satellite images can have several causes,
+-   describe how a supervised classifier learns from reference observations,
+-   read a confusion matrix and distinguish overall from balanced accuracy,
+-   interpret a scenario comparison in terms of assumptions, spatial patterns and class areas.
+
+## Data and preparation
+
+Use the R packages `terra`, `ranger` and `jsonlite`. Keep the Bregaglia GeoPackage in the `communes` folder and the `NCCS-SSP-results` folder in its original structure. Change `data_dir` below to the folder on your computer.
+
+| Input                               | Role in the practical                                             |
+|------------------------------------|------------------------------------|
+| `sentinel2_multiband_2018_100m.tif` | Earlier satellite composite for visual interpretation             |
+| `sentinel2_multiband_2025_100m.tif` | Recent satellite composite and predictor bands for classification |
+| `astat_stratified.gpkg`             | Reference locations with an `AS_27` land-use/land-cover label     |
+| `communes/square_20x20km_Bregaglia_commune.gpkg` | Bregaglia modelling extent used to select samples and crop maps |
+| `Data_earlierass/dhm25_grid_raster.asc` | 25 m elevation model used to derive terrain predictors         |
+| `NCCS-SSP-results/LULC_pal.json`    | Class values, names and colours for the scenario legend           |
+| `NCCS-SSP-results/raster_data`      | SSP-CH land-use scenarios in five-year steps                      |
+
+Each satellite raster has ten bands in standard FORCE order. Bands 1--3 record visible light, bands 4--6 cover the red edge, bands 7--8 cover near-infrared wavelengths and bands 9--10 cover shortwave infrared wavelengths. The images are prepared surface-reflectance composites at 100 m resolution. One grid cell represents a nominal hectare and can contain a mixture of trees, buildings, roads and other surfaces. [FORCE band documentation](https://force-eo.readthedocs.io/en/latest/components/higher-level/hl-input.html)
+
+```{r}
+library(terra)
+library(ranger)
+library(jsonlite)
+
+data_dir <- path.expand("C:/Users/Utente/Downloads/data/data") 
+threads <- 8L #number of cpus
+
+image_2018 <- rast(file.path(data_dir, "sentinel2_multiband_2018_100m.tif"))
+image_2025 <- rast(file.path(data_dir, "sentinel2_multiband_2025_100m.tif"))
+reference <- vect(file.path(data_dir, "astat_stratified.gpkg"))
+bregaglia <- vect(file.path(data_dir, "communes/square_20x20km_Bregaglia_commune.gpkg"))
+palette <- fromJSON(file.path(data_dir, "NCCS-SSP-results", "LULC_pal.json"))
+
+# We need to match water labels to the exported rasters, whose JSON labels are reversed.
+palette$class_name[palette$class_value == 20] <- "Lake"
+palette$class_name[palette$class_value == 21] <- "River"
+
+# give names to the spectral bands
+bands <- c("BLUE", "GREEN", "RED", "RE1", "RE2", "RE3", "BNIR", "NIR", "SWIR1", "SWIR2")
+names(image_2018) <- bands
+names(image_2025) <- bands
+bregaglia_satellite <- project(bregaglia, crs(image_2025))
+```
+
+The vector boundary is projected into the raster's coordinate reference system before cropping. This lets R use the correct spatial coordinates when selecting cells. Assigning band names makes the predictors readable throughout the exercise.
+
+# 1. Interpret the satellite images by eye
+
+## Make a comparable pair of images
+
+A natural-colour image uses the red, green and blue bands. For our FORCE files, these are bands 3, 2 and 1. The display below uses the same reflectance range in both years. Values outside 0--0.25 are clipped for display so bright surfaces have the same saturation threshold. The classifier later uses the original ten-band raster.
+
+`crop()` selects the Bregaglia study area. With `mask = TRUE`, cells outside the GeoPackage polygon become missing values, so this same boundary controls visualisation, model fitting and prediction.
+
+```{r}
+image_2018_bregaglia <- crop(image_2018, bregaglia_satellite, mask = TRUE)
+image_2025_bregaglia <- crop(image_2025, bregaglia_satellite, mask = TRUE)
+
+par(mfrow = c(1, 2))
+plotRGB(clamp(image_2018_bregaglia[[1:3]], 0, 0.25, values = TRUE), r = 3, g = 2, b = 1, scale = 0.25, mar = c(0, 0, 2, 0),
+        main = "Bregaglia — 2018")
+plotRGB(clamp(image_2025_bregaglia[[1:3]], 0, 0.25, values = TRUE), r = 3, g = 2, b = 1, scale = 0.25, mar = c(0, 0, 2, 0),
+        main = "Bregaglia — 2025")
+```
+
+```{r}
+par(mfrow = c(1, 1))
+```
+
+Interpreting images simply manually is complicated. We see changes but they are only qualitative. 2018 is more brown as it has been a drier year than 2025. Different land cover classes are responding differently to drought so we cannot translate the colors directly into land cover classes. This requires translating spectral and spatial patterns into a class definition. A dark green patch might suggest forest, but shadow, crop development and mixed pixels can complicate that interpretation. Weather, soil moisture and the timing of clear observations can also alter a seasonal composite.
+
+Land cover describes the physical surface. Land use includes its purpose or management. A spectral image can support both kinds of interpretation, but management details often require other information. The reference classes used here combine aspects of cover and use.
+
+# 2. Learn a classification rule from reference observations
+
+## Build the training table
+
+Supervised classification turns reference observations into a reproducible prediction rule. At each reference point, we extract a vector of ten reflectance values and associate it with a known class. The bands are the predictors. The class is the response.
+
+The reference file uses the official `AS_27` numbering from the BFS workbook's `Codes AS_27` sheet. It assigns 19 to closed forest, 23 to lakes and 27 to glaciers. The scenario classes use different numbers, so we recode the labels before training. Codes 6, 9, 20 and 25 span several scenario classes and are omitted. Shrubland has no exclusive AS_27 group and is absent from the training labels. Including lakes and the river group gives eleven possible output classes. [BFS variables and class legend](https://dam-api.bfs.admin.ch/hub/api/dam/assets/36824943/master) · [NOAS04 aggregation table](https://dam-api.bfs.admin.ch/hub/api/dam/assets/205795/master)
+
+| AS_27 | Official reference group               | SSP-CH output used here                 |
+|------------------------|------------------------|------------------------|
+| 1     | Industrial and commercial areas        | 10 --- Urban/amenities                  |
+| 2     | Residential areas                      | 10 --- Urban/amenities                  |
+| 3     | Public building areas                  | 10 --- Urban/amenities                  |
+| 4     | Agricultural building areas            | 10 --- Urban/amenities                  |
+| 5     | Unspecified building areas             | 10 --- Urban/amenities                  |
+| 6     | Roads                                  | Omitted, mixes 10 and 11                |
+| 7     | Railway areas                          | 11 --- Static                           |
+| 8     | Airport areas                          | 11 --- Static                           |
+| 9     | Special settlement areas               | Omitted, mixes 10 and 11                |
+| 10    | Recreation and green spaces            | 10 --- Urban/amenities                  |
+| 11    | Orchards                               | 18 --- Permanent crops                  |
+| 12    | Vineyards                              | 18 --- Permanent crops                  |
+| 13    | Horticultural areas                    | 18 --- Permanent crops                  |
+| 14    | Arable land                            | 15 --- Agriculture                      |
+| 15    | Meadows                                | 17 --- Grassland or meadows             |
+| 16    | Pastures near settlements              | 17 --- Grassland or meadows             |
+| 17    | Alpine meadows                         | 17 --- Grassland or meadows             |
+| 18    | Alpine and Jura pastures               | 16 --- Alpine pastures                  |
+| 19    | Closed forest                          | 13 --- Closed forest                    |
+| 20    | Open forest                            | Omitted, mixes 12 and 13                |
+| 21    | Brush forest                           | 13 --- Closed forest                    |
+| 22    | Groves, hedges and tree groups         | 12 --- Open Forest                      |
+| 23    | Lakes                                  | 20 --- Lake                             |
+| 24    | Rivers and flood protection structures | 21 --- River, a coarse group assignment |
+| 25    | Unproductive vegetation                | Omitted, mixes 11 and 14                |
+| 26    | Bare surfaces                          | 11 --- Static                           |
+| 27    | Glaciers and perpetual snow            | 19 --- Glacier                          |
+
+The forest assignments follow the published Evoland aggregation workbook. In particular, its detailed brush-forest class 57 is assigned to output class 13, which is why AS_27 code 21 enters closed forest here. AS_27 code 20 combines detailed classes assigned to both open and closed forest. Using a 27-class field limits how exactly we can reproduce the scenario legend. [Evoland code and aggregation workbook](https://zenodo.org/records/16882051)
+
+The published export script assigns output value 20 to lakes and 21 to rivers. The supplied JSON reverses those two names. The setup chunk corrects the names in the loaded palette to match the raster values. AS_27 code 24 also includes flood protection structures, which the detailed Evoland lookup places in Static. We use its broad river label as a teaching approximation. [Scenario export script in the code release](https://zenodo.org/records/16882051)
+
+For this example, we treat each retained reference label as suitable for the 2025 satellite image. In an application, the survey date and the condition of the site in the image year need to support that assumption. At 100 m resolution, the point label and the average reflectance of a mixed cell can also represent different spatial support.
+
+The model is now explicitly local to Bregaglia. Reference points outside the supplied GeoPackage are excluded before extracting predictors. In addition to the ten reflectance bands, five normalized spectral indices are supplied to the forest: NDVI, NDMI, NBR, NDWI and BSI. These ratios expose vegetation, moisture, burn/bare-surface and water contrasts that are useful in an alpine landscape.
+
+The DHM25 elevation grid adds elevation, slope, northness, eastness, topographic position, terrain ruggedness and roughness. DHM25 is supplied without embedded CRS metadata in the legacy Swiss LV03 coordinate range. Because the local PROJ installation lacks the optional Swiss datum grid, the code applies the LV95 false-origin shift before assigning EPSG:2056. Residual LV03 distortion is well below the 25 m DEM and 100 m modelling resolutions. Terrain derivatives are calculated at the native 25 m resolution and then aligned to the Sentinel grid.
+
+Classes with fewer than 20 usable local observations are excluded because neither a spatial holdout nor a class-specific accuracy estimate would be defensible with only a handful of points. The printed class-count table records this decision. This threshold does not repair the underlying label limitation: the best solution for omitted or mixed AS_27 groups is more detailed reference data.
+
+```{r}
+# Map official AS_27 codes to SSP-CH output classes, including water.
+ssp_lookup <- rep(NA_integer_, 27)
+ssp_lookup[c(1:5, 10)] <- 10L
+ssp_lookup[c(7, 8, 26)] <- 11L
+ssp_lookup[22] <- 12L
+ssp_lookup[c(19, 21)] <- 13L
+ssp_lookup[14] <- 15L
+ssp_lookup[18] <- 16L
+ssp_lookup[15:17] <- 17L
+ssp_lookup[11:13] <- 18L
+ssp_lookup[27] <- 19L
+ssp_lookup[23] <- 20L  # Lakes in the exported SSP-CH rasters
+ssp_lookup[24] <- 21L  # River group, including flood protection structures
+
+reference <- project(reference, crs(image_2025))
+reference_bregaglia <- intersect(reference, bregaglia_satellite)
+
+# Indices are calculated only for the Bregaglia raster to avoid unnecessary work.
+ratio_index <- function(a, b) {
+  ifel(abs(a + b) < 1e-06, NA, (a - b) / (a + b))
+}
+
+ndvi <- ratio_index(image_2025_bregaglia$NIR, image_2025_bregaglia$RED)
+ndmi <- ratio_index(image_2025_bregaglia$NIR, image_2025_bregaglia$SWIR1)
+nbr  <- ratio_index(image_2025_bregaglia$NIR, image_2025_bregaglia$SWIR2)
+ndwi <- ratio_index(image_2025_bregaglia$GREEN, image_2025_bregaglia$NIR)
+bsi_denominator <- image_2025_bregaglia$SWIR1 + image_2025_bregaglia$RED +
+  image_2025_bregaglia$NIR + image_2025_bregaglia$BLUE
+bsi <- ifel(
+  abs(bsi_denominator) < 1e-06, NA,
+  ((image_2025_bregaglia$SWIR1 + image_2025_bregaglia$RED) -
+     (image_2025_bregaglia$NIR + image_2025_bregaglia$BLUE)) /
+    bsi_denominator
+)
+names(ndvi) <- "NDVI"
+names(ndmi) <- "NDMI"
+names(nbr) <- "NBR"
+names(ndwi) <- "NDWI"
+names(bsi) <- "BSI"
+
+# Prepare terrain predictors in the native 25 m DEM grid.
+dem <- rast(file.path(data_dir, "Data_earlierass", "dhm25_grid_raster.asc"))
+dem <- shift(dem, dx = 2000000, dy = 1000000)
+crs(dem) <- "EPSG:2056"
+bregaglia_lv95 <- project(bregaglia, crs(dem))
+dem_local <- crop(dem, buffer(bregaglia_lv95, width = 1000), mask = TRUE)
+names(dem_local) <- "elevation"
+
+terrain_native <- terrain(
+  dem_local,
+  v = c("slope", "aspect", "TPI", "TRI", "roughness"),
+  unit = "degrees", neighbors = 8
+)
+northness <- cos(terrain_native$aspect * pi / 180)
+eastness <- sin(terrain_native$aspect * pi / 180)
+names(northness) <- "northness"
+names(eastness) <- "eastness"
+terrain_native <- c(
+  dem_local, terrain_native$slope, northness, eastness,
+  terrain_native$TPI, terrain_native$TRI, terrain_native$roughness
+)
+names(terrain_native) <- c(
+  "elevation", "slope", "northness", "eastness",
+  "TPI", "TRI", "roughness"
+)
+terrain_bregaglia <- project(
+  terrain_native, image_2025_bregaglia, method = "bilinear"
+)
+
+predictors_bregaglia <- c(
+  image_2025_bregaglia, ndvi, ndmi, nbr, ndwi, bsi, terrain_bregaglia
+)
+predictor_names <- names(predictors_bregaglia)
+
+class_code <- ssp_lookup[as.integer(as.character(reference_bregaglia$AS_27))]
+xy <- crds(reference_bregaglia)
+samples <- na.omit(data.frame(
+  SSP_CH = factor(class_code),
+  x = xy[, 1],
+  y = xy[, 2],
+  extract(predictors_bregaglia, reference_bregaglia, ID = FALSE)
+))
+
+class_counts_before_filter <- table(samples$SSP_CH)
+class_counts_before_filter
+minimum_class_size <- 20L
+rare_classes <- names(class_counts_before_filter)[
+  class_counts_before_filter < minimum_class_size
+]
+if (length(rare_classes) > 0) {
+  message("Excluded locally rare classes: ", paste(rare_classes, collapse = ", "))
+  samples <- droplevels(samples[!samples$SSP_CH %in% rare_classes, ])
+}
+
+# Five-kilometre blocks prevent nearby points from being split between
+# development and assessment data. Fold 5 is untouched during tuning.
+samples$block <- interaction(
+  floor(samples$x / 5000), floor(samples$y / 5000), drop = TRUE
+)
+
+# Report both raw observations and spatial coverage. A large point count in one
+# block is weaker evidence than observations spread across the study area.
+class_block_coverage <- data.frame(
+  class = levels(samples$SSP_CH),
+  n_observations = as.integer(table(samples$SSP_CH)),
+  n_spatial_blocks = vapply(
+    levels(samples$SSP_CH),
+    function(k) length(unique(samples$block[samples$SSP_CH == k])),
+    integer(1)
+  )
+)
+class_block_coverage
+
+# Try many block assignments and retain the one with the best minimum class
+# representation across folds, with a small penalty for unequal fold sizes.
+# Points never leave their spatial block, so this does not introduce leakage.
+set.seed(333)
+block_ids <- levels(samples$block)
+block_class_counts <- table(samples$block, samples$SSP_CH)
+best_fold_score <- -Inf
+block_fold <- NULL
+for (attempt in seq_len(2000)) {
+  candidate <- sample(rep(seq_len(5), length.out = length(block_ids)))
+  fold_class_counts <- rowsum(block_class_counts, group = candidate, reorder = FALSE)
+  class_proportions <- sweep(
+    fold_class_counts, 2, colSums(block_class_counts), "/"
+  )
+  fold_sizes <- rowSums(fold_class_counts)
+  score <- min(class_proportions) -
+    0.05 * stats::sd(fold_sizes) / mean(fold_sizes)
+  if (score > best_fold_score) {
+    best_fold_score <- score
+    block_fold <- setNames(candidate, block_ids)
+  }
+}
+samples$spatial_fold <- unname(block_fold[as.character(samples$block)])
+
+fold_class_coverage <- table(samples$spatial_fold, samples$SSP_CH)
+fold_class_coverage
+if (any(fold_class_coverage == 0)) {
+  warning("At least one spatial fold lacks a class; interpret its class metrics cautiously.")
+}
+
+development <- samples[samples$spatial_fold != 5, ]
+testing <- samples[samples$spatial_fold == 5, ]
+```
+
+## Tune and fit the Random Forest
+
+A decision tree repeatedly splits observations using predictor thresholds. For example, a split might divide observations according to near-infrared reflectance. Further splits can use other bands to distinguish the classes.
+
+A Random Forest combines many trees. Each tree is trained using a random sample of observations, and each split considers a random subset of predictor bands. For classification, the trees vote for a class. Combining their votes reduces the influence of any single tree. [Breiman, 2001](https://doi.org/10.1023/A:1010933404324)
+
+The forest is tuned on four spatial folds. We compare the number of candidate predictors per split (`mtry`), terminal-node size, bootstrap sampling fraction and the standard versus extremely randomized split rule. Inverse-frequency class weights keep the most common local classes from dominating selection. Balanced accuracy, rather than overall accuracy, is the tuning objective. The fifth spatial fold remains untouched until the best settings have been selected. [ranger documentation](https://imbs-hl.github.io/ranger/reference/ranger.html)
+
+```{r}
+balanced_accuracy <- function(observed, predicted) {
+  observed <- as.character(observed)
+  predicted <- as.character(predicted)
+  observed_classes <- sort(unique(observed))
+  mean(vapply(
+    observed_classes,
+    function(k) mean(predicted[observed == k] == k),
+    numeric(1)
+  ))
+}
+
+make_class_weights <- function(y) {
+  counts <- table(droplevels(y))
+  weights <- sum(counts) / (length(counts) * counts)
+  setNames(as.numeric(weights), names(counts))
+}
+
+p <- length(predictor_names)
+tuning_grid <- expand.grid(
+  mtry = unique(c(2L, floor(sqrt(p)), ceiling(p / 2), p)),
+  min.node.size = c(1L, 5L, 10L, 20L),
+  sample.fraction = c(0.632, 0.8),
+  splitrule = c("gini", "extratrees"),
+  stringsAsFactors = FALSE
+)
+tuning_grid$balanced_accuracy <- NA_real_
+
+tuning_folds <- sort(unique(development$spatial_fold))
+for (g in seq_len(nrow(tuning_grid))) {
+  fold_scores <- numeric(length(tuning_folds))
+
+  for (j in seq_along(tuning_folds)) {
+    validation_fold <- tuning_folds[j]
+    train_index <- development$spatial_fold != validation_fold
+    validation_index <- !train_index
+    y_train <- droplevels(development$SSP_CH[train_index])
+
+    fold_model <- ranger(
+      x = development[train_index, predictor_names, drop = FALSE],
+      y = y_train,
+      num.trees = 250,
+      mtry = tuning_grid$mtry[g],
+      min.node.size = tuning_grid$min.node.size[g],
+      sample.fraction = tuning_grid$sample.fraction[g],
+      splitrule = tuning_grid$splitrule[g],
+      class.weights = make_class_weights(y_train),
+      num.threads = threads,
+      seed = 333 + g + j
+    )
+
+    fold_prediction <- predict(
+      fold_model,
+      data = development[validation_index, predictor_names, drop = FALSE],
+      num.threads = threads
+    )$predictions
+    fold_scores[j] <- balanced_accuracy(
+      development$SSP_CH[validation_index], fold_prediction
+    )
+  }
+
+  tuning_grid$balanced_accuracy[g] <- mean(fold_scores)
+}
+
+tuning_results <- tuning_grid[
+  order(tuning_grid$balanced_accuracy, decreasing = TRUE),
+]
+head(tuning_results, 10)
+best <- tuning_results[1, ]
+```
+
+```{r}
+# Fit only on the development folds for an honest final assessment on fold 5.
+y_development <- droplevels(development$SSP_CH)
+rf_assessment <- ranger(
+  x = development[, predictor_names, drop = FALSE],
+  y = y_development,
+  num.trees = 1000,
+  mtry = best$mtry[[1]],
+  min.node.size = best$min.node.size[[1]],
+  sample.fraction = best$sample.fraction[[1]],
+  splitrule = best$splitrule[[1]],
+  class.weights = make_class_weights(y_development),
+  importance = "permutation",
+  num.threads = threads,
+  seed = 333
+)
+
+test_prediction <- predict(
+  rf_assessment,
+  data = testing[, predictor_names, drop = FALSE],
+  num.threads = threads
+)$predictions
+model_classes <- levels(samples$SSP_CH)
+confusion <- table(
+  observed = factor(testing$SSP_CH, levels = model_classes),
+  predicted = factor(test_prediction, levels = model_classes)
+)
+confusion
+```
+
+```{r}
+class_recall <- diag(confusion) / rowSums(confusion)
+class_precision <- ifelse(
+  colSums(confusion) > 0, diag(confusion) / colSums(confusion), 0
+)
+class_f1 <- ifelse(
+  class_recall + class_precision > 0,
+  2 * class_recall * class_precision / (class_recall + class_precision),
+  0
+)
+assessed_classes <- rowSums(confusion) > 0
+test_statistics <- data.frame(
+  overall_accuracy_pct = round(100 * sum(diag(confusion)) / sum(confusion), 1),
+  balanced_accuracy_pct = round(100 * mean(class_recall[assessed_classes]), 1),
+  macro_f1_pct = round(100 * mean(class_f1[assessed_classes]), 1)
+)
+test_statistics
+
+class_statistics <- data.frame(
+  class = model_classes[assessed_classes],
+  n_test = rowSums(confusion)[assessed_classes],
+  recall_pct = round(100 * class_recall[assessed_classes], 1),
+  precision_pct = round(100 * class_precision[assessed_classes], 1),
+  f1_pct = round(100 * class_f1[assessed_classes], 1)
+)
+class_statistics
+
+variable_importance <- data.frame(
+  predictor = names(rf_assessment$variable.importance),
+  importance = as.numeric(rf_assessment$variable.importance)
+)
+variable_importance <- variable_importance[
+  order(variable_importance$importance, decreasing = TRUE),
+]
+variable_importance
+```
+
+## Read the test results
+
+The confusion matrix compares predictions with the labels of the reserved test points. Each row is an observed class and each column is a predicted class. The diagonal contains correct predictions. Off-diagonal entries show which classes the model confuses.
+
+Overall accuracy gives the fraction of test observations classified correctly. For a confusion matrix $C$,
+
+$$\text{OA} = \frac{\sum\limits_{k}C_{kk}}{\sum\limits_{i}\sum\limits_{j}C_{ij}}.$$
+
+Recall for class $k$ is the fraction of its reference observations recovered correctly. Balanced accuracy gives every class the same weight by averaging those recalls,
+
+$$\text{Recall}_{k} = \frac{C_{kk}}{\sum\limits_{j}C_{kj}},\qquad\text{BA} = \frac{1}{K}\sum\limits_{k = 1}^{K}\text{Recall}_{k}.$$
+
+For example, if 35 of 50 reference forest points are predicted as forest, forest recall is 70%. Overall accuracy can be dominated by classes with many test observations. Balanced accuracy helps reveal whether performance is uneven across classes.
+
+These scores refer to the untouched Bregaglia spatial holdout. They are deliberately more demanding than a random point split because neighbouring observations remain in the same five-kilometre block. The source sample is stratified, so overall accuracy still does not directly estimate the fraction of Bregaglia's mapped area that is correct. Inspect the per-class statistics and confusion matrix alongside the summary scores. [Roberts et al., 2017](https://doi.org/10.1111/ecog.02881)
+
+## Fit all Bregaglia observations and map Bregaglia
+
+After assessment, the selected settings are used to refit a production forest with all usable Bregaglia observations. `terra::predict()` writes predictions only for the Bregaglia predictor stack. The small wrapper converts factor predictions back to their numeric SSP-CH class codes.
+
+```{r}
+predict_class <- function(model, data) {
+  as.integer(as.character(predict(model, data = data, num.threads = threads)$predictions))
+}
+
+y_all <- droplevels(samples$SSP_CH)
+rf <- ranger(
+  x = samples[, predictor_names, drop = FALSE],
+  y = y_all,
+  num.trees = 1000,
+  mtry = best$mtry[[1]],
+  min.node.size = best$min.node.size[[1]],
+  sample.fraction = best$sample.fraction[[1]],
+  splitrule = best$splitrule[[1]],
+  class.weights = make_class_weights(y_all),
+  importance = "permutation",
+  num.threads = threads,
+  seed = 333
+)
+
+prediction_bregaglia <- terra::predict(
+  predictors_bregaglia, rf, fun = predict_class, na.rm = TRUE,
+  filename = file.path(data_dir, "landcover_RF_SSPCH_Bregaglia_2025.tif"),
+  overwrite = TRUE, wopt = list(datatype = "INT1U")
+)
+```
+
+```{r}
+rf_palette <- palette[palette$class_value %in% levels(samples$SSP_CH), ]
+levels(prediction_bregaglia) <- rf_palette[, c("class_value", "class_name")]
+plot(prediction_bregaglia, col = rf_palette$colour, type = "classes",
+     axes = FALSE, main = "Random Forest — Bregaglia, 2025",
+     plg = list(cex = 0.75))
+```
+
+The classifier can only assign classes represented in its training labels. Including lake and river reference points lets it learn water signatures alongside the land classes. Shrubland remains absent because the available reference aggregation cannot isolate it. Inspect both errors among learned classes and the effect of this incomplete legend.
+
+The map also describes 2025 only. Evaluating change between 2018 and 2025 would require evaluating classification performance for both dates and investigating the uncertainty of apparent transitions, but that is currently beyond the scope of this exercise.
+
+# 3. Explore possible future landscapes
+
+## Introduce scenario assumptions
+
+Satellite observations describe conditions at the time of observation. To explore future land use, we need assumptions about the processes that could change it.
+
+The SSP-CH maps used here come from the Evoland land-use model. It distributes land-use change across a 100 m grid using scenario-specific class demands and spatial restrictions. These restrictions include environmental conditions, infrastructure and regional constraints. [SSP-CH land-use methods](https://ssp-ch-szenarien.wsl.ch/en/land-use-and-land-use-change-in-the-ssp-ch/)
+
+Here we compare SSP0, described as a frugal Switzerland, with SSP5, described as a resource-intensive Switzerland. Their 2080 maps represent outcomes under different socioeconomic assumptions. The 2025 scenario maps are model states and can differ from the Random Forest's interpretation of the satellite image. The classifier's test accuracy applies to its 2025 predictions. Evaluating the scenario model calls for evidence about its assumptions and modelling process. [SSP-CH scenarios](https://ssp-ch-szenarien.wsl.ch/en/land-use-and-land-use-change-in-the-ssp-ch/) · [Scenario dataset](https://zenodo.org/records/17108008)
+
+```{r}
+scenario_dir <- file.path(data_dir, "NCCS-SSP-results", "raster_data")
+ssp0_2025 <- rast(file.path(scenario_dir, "SSP0", "SSP0-2025.tif"))
+ssp0_2080 <- rast(file.path(scenario_dir, "SSP0", "SSP0-2080.tif"))
+ssp5_2025 <- rast(file.path(scenario_dir, "SSP5", "SSP5-2025.tif"))
+ssp5_2080 <- rast(file.path(scenario_dir, "SSP5", "SSP5-2080.tif"))
+
+scenario_maps <- c(ssp0_2025, ssp0_2080, ssp5_2025, ssp5_2080)
+names(scenario_maps) <- c("SSP0 — 2025", "SSP0 — 2080", "SSP5 — 2025", "SSP5 — 2080")
+bregaglia_scenarios <- project(bregaglia, crs(scenario_maps))
+scenarios_bregaglia <- crop(scenario_maps, bregaglia_scenarios, mask = TRUE)
+levels(scenarios_bregaglia) <- rep(list(palette[, c("class_value", "class_name")]), 4)
+
+plot(scenarios_bregaglia, nr = 2, nc = 2, col = palette$colour,
+     type = "classes", axes = FALSE,
+     main = c("SSP0 — 2025", "SSP0 — 2080", "SSP5 — 2025", "SSP5 — 2080"),
+     plg = list(cex = 0.65))
+```
+
+Each row shows one scenario. The left column shows 2025 and the right column shows 2080. The same JSON legend is used throughout.
+
+Inspect where the scenarios place settlement, agriculture and forest. Look for both the amount of each class and the spatial configuration of its patches. Similar class totals can coexist with different arrangements in the landscape.
+
+## Quantify the difference between scenarios in 2080
+
+Maps reveal location and configuration. A class-area comparison makes the magnitude of the difference easier to assess.
+
+For each class, we count the cells in each 2080 map and multiply by 0.01 km², the nominal area of a 100 m × 100 m grid cell. Only cells with values in both maps enter the comparison. These are grid-based area estimates, including the rasterised canton boundary.
+
+The final plot shows
+
+$$D_{k} = A_{k,\,\text{SSP5},\, 2080} - A_{k,\,\text{SSP0},\, 2080}.$$
+
+A positive value means that a class occupies more area in SSP5 in 2080. A negative value means that it occupies more area in SSP0. This compares the two future endpoints. To calculate change through time within a scenario, compare its 2080 map with its own 2025 map.
+
+```{r}
+cover_2080 <- values(scenarios_bregaglia[[c(2, 4)]])
+cover_2080 <- na.omit(cover_2080)
+
+area_ssp0 <- table(factor(cover_2080[, 1], levels = palette$class_value)) * 0.01
+area_ssp5 <- table(factor(cover_2080[, 2], levels = palette$class_value)) * 0.01
+difference_km2 <- as.numeric(area_ssp5 - area_ssp0)
+
+par(mar = c(4, 11, 3, 1))
+barplot(rev(difference_km2), names.arg = rev(palette$class_name),
+        horiz = TRUE, las = 1, col = rev(palette$colour),
+        border = NA, cex.names = 0.85,
+        xlab = "Area difference in 2080 (SSP5 minus SSP0), km²",
+        main = "How do the 2080 scenarios differ in Bregaglia?")
+abline(v = 0, lty = 2)
+```
+
+```{r}
+par(mar = c(5, 4, 4, 2) + 0.1)
+```
+
+## Data attribution
+
+The Bregaglia study polygon is supplied in the course GeoPackage. The satellite composites and reference sample were prepared for this course. The scenario rasters, class values and colours are from Black, Gubler and Kemmler's NCCS SSP-CH results, released under CC BY 4.0. [NCCS scenario data and citation](https://zenodo.org/records/17108008)

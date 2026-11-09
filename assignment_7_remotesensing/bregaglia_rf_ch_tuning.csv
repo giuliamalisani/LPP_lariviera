@@ -1,0 +1,13 @@
+"mtry","min.node.size","sample.fraction","splitrule","development_macro_f1"
+22,5,0.632,"extratrees",54.8726609305441
+22,5,0.8,"extratrees",54.3038747453174
+4,5,0.8,"extratrees",53.4907830121399
+11,5,0.8,"extratrees",53.2563480576538
+22,20,0.8,"extratrees",53.1080919236674
+11,20,0.8,"extratrees",53.0412189354354
+11,5,0.632,"extratrees",52.437766179112
+11,20,0.632,"extratrees",52.1100524447068
+22,20,0.632,"extratrees",52.071582327342
+4,20,0.8,"extratrees",51.9090751844079
+4,5,0.632,"extratrees",51.9020268174931
+4,20,0.632,"extratrees",50.2365515417483

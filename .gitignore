@@ -1,0 +1,9 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+Rplots.pdf
+*_files/
+*.html
+*.utf8.md
+*.knit.md

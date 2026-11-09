@@ -1,0 +1,62 @@
+[
+    {
+        "class_name": "Urban/amenities",
+        "colour": "#a8aba5",
+        "class_value": 10
+    },
+    {
+        "class_name": "Static",
+        "colour": "#d1d3cf",
+        "class_value": 11
+    },
+    {
+        "class_name": "Open Forest",
+        "colour": "#97d1d5",
+        "class_value": 12
+    },
+    {
+        "class_name": "Closed forest",
+        "colour": "#29898f",
+        "class_value": 13
+    },
+    {
+        "class_name": "Overgrown/shrubland",
+        "colour": "#bb8a75",
+        "class_value": 14
+    },
+    {
+        "class_name": "Agriculture",
+        "colour": "#f59f78",
+        "class_value": 15
+    },
+    {
+        "class_name": "Alpine pastures",
+        "colour": "#6ca147",
+        "class_value": 16
+    },
+    {
+        "class_name": "Grassland or meadows",
+        "colour": "#c4e0a1",
+        "class_value": 17
+    },
+    {
+        "class_name": "Permanent crops",
+        "colour": "#DDCC66",
+        "class_value": 18
+    },
+    {
+        "class_name": "Glacier",
+        "colour": "#d5f1ff",
+        "class_value": 19
+    },
+    {
+        "class_name": "River",
+        "colour": "#93d0ee",
+        "class_value": 20
+    },
+    {
+        "class_name": "Lake",
+        "colour": "#93d0ee",
+        "class_value": 21
+    }
+]

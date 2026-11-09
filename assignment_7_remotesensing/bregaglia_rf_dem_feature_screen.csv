@@ -1,0 +1,5 @@
+"feature_set","weighted","cv_macro_f1","cv_balanced_accuracy"
+"spectral_terrain",TRUE,0.510201230621024,0.552873817148845
+"spectral_2025",TRUE,0.456558290461168,0.498812067181091
+"spectral_terrain",FALSE,0.406558240533716,0.457807029569703
+"spectral_2025",FALSE,0.400161276741444,0.440771242378651

@@ -1,0 +1,4 @@
+"test","model_classes","evaluation_classes","overall_accuracy_pct","balanced_accuracy_pct","macro_f1_pct"
+"Fine model, fine evaluation",9,9,67.8,65.9,65.2
+"Fine model, post-hoc coarse evaluation",9,6,78.2,76.3,75.7
+"Coarse model, coarse evaluation",6,6,76.6,72.8,73.1

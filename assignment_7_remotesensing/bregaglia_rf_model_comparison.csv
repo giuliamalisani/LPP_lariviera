@@ -1,0 +1,7 @@
+"model","training_scope","predictors","tuned","n_training","n_test","overall_accuracy_pct","balanced_accuracy_pct","macro_f1_pct"
+"Hybrid CH + Bregaglia terrain","CH-wide plus weighted Bregaglia development blocks","Bands + indices + DHM25 terrain","Yes",46329,367,68.9,66.2,65.3
+"Tuned Bregaglia terrain","Bregaglia development blocks","Bands + indices + DHM25 terrain","Yes",1329,367,67.8,65.9,65.2
+"Basic CH transfer","CH-wide, Bregaglia excluded","10 bands","No",45000,367,62.9,61.8,60.2
+"Tuned CH terrain transfer","CH-wide, Bregaglia excluded","Bands + indices + DHM25 terrain","Yes",45000,367,59.1,61,58.1
+"Tuned Bregaglia spectral","Bregaglia development blocks","10 bands + 5 indices","Yes",1329,367,61,55.6,55.7
+"Basic Bregaglia","Bregaglia development blocks","10 bands","No",1329,367,56.7,47.1,45.7

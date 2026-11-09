@@ -1,0 +1,9 @@
+"feature_set","weighted","cv_macro_f1"
+"temporal_context",TRUE,0.523965193670459
+"context",TRUE,0.520025110470188
+"temporal",TRUE,0.515240584200606
+"spectral_2025",TRUE,0.509224389498575
+"temporal",FALSE,0.439031547599191
+"context",FALSE,0.42794442507026
+"spectral_2025",FALSE,0.419890844203325
+"temporal_context",FALSE,0.416266891344442
