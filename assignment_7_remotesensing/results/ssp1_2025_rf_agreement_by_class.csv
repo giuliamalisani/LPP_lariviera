@@ -1,0 +1,25 @@
+"model","class_value","class_name","n_ssp1","n_rf","agreement_recall_pct","agreement_precision_pct","iou_pct"
+"Original national RF output",10,"Urban/amenities",143,2451,27.972027972028,1.63198694410445,1.56617071260767
+"Original national RF output",11,"Static",12650,11633,67.3438735177866,73.2313246797902,54.0408525754885
+"Original national RF output",12,"Open Forest",1415,582,7.34982332155477,17.8694158075601,5.49392498679345
+"Original national RF output",13,"Closed forest",4639,4591,61.7805561543436,62.4264866042257,45.0345694531741
+"Original national RF output",14,"Overgrown/shrubland",5299,0,0,NA,0
+"Original national RF output",15,"Agriculture",2,47,0,0,0
+"Original national RF output",16,"Alpine pastures",7083,7713,62.2335168713822,57.1502657850382,42.4335772044667
+"Original national RF output",17,"Grassland or meadows",1143,2527,48.3814523184602,21.8836565096953,17.7414180301572
+"Original national RF output",18,"Permanent crops",10,1098,20,0.182149362477231,0.180831826401447
+"Original national RF output",19,"Glacier",517,1915,75.0483558994197,20.2610966057441,18.9823874755382
+"Original national RF output",20,"Lake",629,524,62.9570747217806,75.5725190839695,52.3117569352708
+"Original national RF output",21,"River",375,824,8,3.64077669902913,2.56629597946963
+"Local terrain RF output",10,"Urban/amenities",143,588,34.965034965035,8.50340136054422,7.34214390602056
+"Local terrain RF output",11,"Static",12650,12071,71.5889328063241,75.0227818739127,57.8104053622726
+"Local terrain RF output",12,"Open Forest",1415,1954,23.1802120141343,16.7860798362334,10.7859256823413
+"Local terrain RF output",13,"Closed forest",4639,5409,69.0019400732916,59.1791458679978,46.7504016357529
+"Local terrain RF output",14,"Overgrown/shrubland",5299,0,0,NA,0
+"Local terrain RF output",15,"Agriculture",2,0,0,NA,0
+"Local terrain RF output",16,"Alpine pastures",7083,7865,62.4170549202315,56.2110616656071,41.9967702099364
+"Local terrain RF output",17,"Grassland or meadows",1143,2198,56.8678915135608,29.5723384895359,24.1545893719807
+"Local terrain RF output",18,"Permanent crops",10,0,0,NA,0
+"Local terrain RF output",19,"Glacier",517,1852,79.6905222437137,22.2462203023758,21.0526315789474
+"Local terrain RF output",20,"Lake",629,582,68.6804451510334,74.2268041237113,55.4557124518614
+"Local terrain RF output",21,"River",375,1386,14.6666666666667,3.96825396825397,3.22391559202814

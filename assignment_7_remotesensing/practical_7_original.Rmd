@@ -1,0 +1,315 @@
+---
+title: "From satellite images to land-cover futures"
+subtitle: "Landscape change and remote sensing"
+author: "Dirk N. Karger"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+How can we describe a landscape, evaluate our interpretation and explore how it could develop? In this practical, you work through three approaches using the Canton of Zurich.
+
+First, interpret two satellite images by eye. Then use reference observations to train and test a Random Forest that maps land cover in 2025. Finally, explore SSP-CH scenarios and quantify how two possible futures differ.
+
+By the end, you should be able to
+
+-   explain why a visible difference between satellite images can have several causes,
+-   describe how a supervised classifier learns from reference observations,
+-   read a confusion matrix and distinguish overall from balanced accuracy,
+-   interpret a scenario comparison in terms of assumptions, spatial patterns and class areas.
+
+## Data and preparation
+
+Use the R packages `terra`, `ranger` and `jsonlite`. Place the supplied `zurich.gpkg` alongside the satellite images and reference points. Keep the `NCCS-SSP-results` folder in its original structure. Change `data_dir` below to the folder on your computer.
+
+| Input                               | Role in the practical                                             |
+|------------------------------------|------------------------------------|
+| `sentinel2_multiband_2018_100m.tif` | Earlier satellite composite for visual interpretation             |
+| `sentinel2_multiband_2025_100m.tif` | Recent satellite composite and predictor bands for classification |
+| `astat_stratified.gpkg`             | Reference locations with an `AS_27` land-use/land-cover label     |
+| `zurich.gpkg`                       | Cantonal boundary used to crop and mask the maps                  |
+| `NCCS-SSP-results/LULC_pal.json`    | Class values, names and colours for the scenario legend           |
+| `NCCS-SSP-results/raster_data`      | SSP-CH land-use scenarios in five-year steps                      |
+
+Each satellite raster has ten bands in standard FORCE order. Bands 1--3 record visible light, bands 4--6 cover the red edge, bands 7--8 cover near-infrared wavelengths and bands 9--10 cover shortwave infrared wavelengths. The images are prepared surface-reflectance composites at 100 m resolution. One grid cell represents a nominal hectare and can contain a mixture of trees, buildings, roads and other surfaces. [FORCE band documentation](https://force-eo.readthedocs.io/en/latest/components/higher-level/hl-input.html)
+
+```{r}
+library(terra)
+library(ranger)
+library(jsonlite)
+
+data_dir <- path.expand("C:/scratch/data")
+threads <- 8L #number of cpus
+
+image_2018 <- rast(file.path(data_dir, "sentinel2_multiband_2018_100m.tif"))
+image_2025 <- rast(file.path(data_dir, "sentinel2_multiband_2025_100m.tif"))
+reference <- vect(file.path(data_dir, "astat_stratified.gpkg"))
+zurich <- vect(file.path(data_dir, "zurich.gpkg")) # a shapefile for the canton of Zurich. It can be replaced by any other region in Switzerland !
+palette <- fromJSON(file.path(data_dir, "NCCS-SSP-results", "LULC_pal.json"))
+
+# We need to match water labels to the exported rasters, whose JSON labels are reversed.
+palette$class_name[palette$class_value == 20] <- "Lake"
+palette$class_name[palette$class_value == 21] <- "River"
+
+# give names to the spectral bands
+bands <- c("BLUE", "GREEN", "RED", "RE1", "RE2", "RE3", "BNIR", "NIR", "SWIR1", "SWIR2")
+names(image_2018) <- bands
+names(image_2025) <- bands
+zurich_satellite <- project(zurich, crs(image_2025))
+```
+
+The vector boundary is projected into the raster's coordinate reference system before cropping. This lets R use the correct spatial coordinates when selecting cells. Assigning band names makes the predictors readable throughout the exercise.
+
+# 1. Interpret the satellite images by eye
+
+## Make a comparable pair of images
+
+A natural-colour image uses the red, green and blue bands. For our FORCE files, these are bands 3, 2 and 1. The display below uses the same reflectance range in both years. Values outside 0--0.25 are clipped for display so bright surfaces have the same saturation threshold. The classifier later uses the original ten-band raster.
+
+`crop()` selects the rectangular region around Zurich. With `mask = TRUE`, cells outside the canton become missing values, so the plotted outline follows the boundary.
+
+```{r}
+image_2018_zurich <- crop(image_2018, zurich_satellite, mask = TRUE)
+image_2025_zurich <- crop(image_2025, zurich_satellite, mask = TRUE)
+
+par(mfrow = c(1, 2))
+plotRGB(clamp(image_2018_zurich[[1:3]], 0, 0.25, values = TRUE), r = 3, g = 2, b = 1, scale = 0.25, mar = c(0, 0, 2, 0),
+        main = "Zurich — 2018")
+plotRGB(clamp(image_2025_zurich[[1:3]], 0, 0.25, values = TRUE), r = 3, g = 2, b = 1, scale = 0.25, mar = c(0, 0, 2, 0),
+        main = "Zurich — 2025")
+```
+
+```{r}
+par(mfrow = c(1, 1))
+```
+
+Interpreting images simply manually is complicated. We see changes but they are only qualitative. 2018 is more brown as it has been a drier year than 2025. Different land cover classes are responding differently to drought so we cannot translate the colors directly into land cover classes. This requires translating spectral and spatial patterns into a class definition. A dark green patch might suggest forest, but shadow, crop development and mixed pixels can complicate that interpretation. Weather, soil moisture and the timing of clear observations can also alter a seasonal composite.
+
+Land cover describes the physical surface. Land use includes its purpose or management. A spectral image can support both kinds of interpretation, but management details often require other information. The reference classes used here combine aspects of cover and use.
+
+# 2. Learn a classification rule from reference observations
+
+## Build the training table
+
+Supervised classification turns reference observations into a reproducible prediction rule. At each reference point, we extract a vector of ten reflectance values and associate it with a known class. The bands are the predictors. The class is the response.
+
+The reference file uses the official `AS_27` numbering from the BFS workbook's `Codes AS_27` sheet. It assigns 19 to closed forest, 23 to lakes and 27 to glaciers. The scenario classes use different numbers, so we recode the labels before training. Codes 6, 9, 20 and 25 span several scenario classes and are omitted. Shrubland has no exclusive AS_27 group and is absent from the training labels. Including lakes and the river group gives eleven possible output classes. [BFS variables and class legend](https://dam-api.bfs.admin.ch/hub/api/dam/assets/36824943/master) · [NOAS04 aggregation table](https://dam-api.bfs.admin.ch/hub/api/dam/assets/205795/master)
+
+| AS_27 | Official reference group               | SSP-CH output used here                 |
+|------------------------|------------------------|------------------------|
+| 1     | Industrial and commercial areas        | 10 --- Urban/amenities                  |
+| 2     | Residential areas                      | 10 --- Urban/amenities                  |
+| 3     | Public building areas                  | 10 --- Urban/amenities                  |
+| 4     | Agricultural building areas            | 10 --- Urban/amenities                  |
+| 5     | Unspecified building areas             | 10 --- Urban/amenities                  |
+| 6     | Roads                                  | Omitted, mixes 10 and 11                |
+| 7     | Railway areas                          | 11 --- Static                           |
+| 8     | Airport areas                          | 11 --- Static                           |
+| 9     | Special settlement areas               | Omitted, mixes 10 and 11                |
+| 10    | Recreation and green spaces            | 10 --- Urban/amenities                  |
+| 11    | Orchards                               | 18 --- Permanent crops                  |
+| 12    | Vineyards                              | 18 --- Permanent crops                  |
+| 13    | Horticultural areas                    | 18 --- Permanent crops                  |
+| 14    | Arable land                            | 15 --- Agriculture                      |
+| 15    | Meadows                                | 17 --- Grassland or meadows             |
+| 16    | Pastures near settlements              | 17 --- Grassland or meadows             |
+| 17    | Alpine meadows                         | 17 --- Grassland or meadows             |
+| 18    | Alpine and Jura pastures               | 16 --- Alpine pastures                  |
+| 19    | Closed forest                          | 13 --- Closed forest                    |
+| 20    | Open forest                            | Omitted, mixes 12 and 13                |
+| 21    | Brush forest                           | 13 --- Closed forest                    |
+| 22    | Groves, hedges and tree groups         | 12 --- Open Forest                      |
+| 23    | Lakes                                  | 20 --- Lake                             |
+| 24    | Rivers and flood protection structures | 21 --- River, a coarse group assignment |
+| 25    | Unproductive vegetation                | Omitted, mixes 11 and 14                |
+| 26    | Bare surfaces                          | 11 --- Static                           |
+| 27    | Glaciers and perpetual snow            | 19 --- Glacier                          |
+
+The forest assignments follow the published Evoland aggregation workbook. In particular, its detailed brush-forest class 57 is assigned to output class 13, which is why AS_27 code 21 enters closed forest here. AS_27 code 20 combines detailed classes assigned to both open and closed forest. Using a 27-class field limits how exactly we can reproduce the scenario legend. [Evoland code and aggregation workbook](https://zenodo.org/records/16882051)
+
+The published export script assigns output value 20 to lakes and 21 to rivers. The supplied JSON reverses those two names. The setup chunk corrects the names in the loaded palette to match the raster values. AS_27 code 24 also includes flood protection structures, which the detailed Evoland lookup places in Static. We use its broad river label as a teaching approximation. [Scenario export script in the code release](https://zenodo.org/records/16882051)
+
+For this example, we treat each retained reference label as suitable for the 2025 satellite image. In an application, the survey date and the condition of the site in the image year need to support that assumption. At 100 m resolution, the point label and the average reflectance of a mixed cell can also represent different spatial support.
+
+We reserve 20% of the usable observations for testing. The model will learn from the other 80%. `set.seed()` makes this random split reproducible. `na.omit()` removes rows with missing labels or missing predictor values.
+
+```{r}
+# Map official AS_27 codes to SSP-CH output classes, including water.
+ssp_lookup <- rep(NA_integer_, 27)
+ssp_lookup[c(1:5, 10)] <- 10L
+ssp_lookup[c(7, 8, 26)] <- 11L
+ssp_lookup[22] <- 12L
+ssp_lookup[c(19, 21)] <- 13L
+ssp_lookup[14] <- 15L
+ssp_lookup[18] <- 16L
+ssp_lookup[15:17] <- 17L
+ssp_lookup[11:13] <- 18L
+ssp_lookup[27] <- 19L
+ssp_lookup[23] <- 20L  # Lakes in the exported SSP-CH rasters
+ssp_lookup[24] <- 21L  # River group, including flood protection structures
+
+reference <- project(reference, crs(image_2025))
+class_code <- ssp_lookup[as.integer(as.character(reference$AS_27))]
+samples <- na.omit(data.frame(
+  SSP_CH = factor(class_code),
+  extract(image_2025, reference, ID = FALSE)
+))
+
+set.seed(333)
+train_rows <- sample(seq_len(nrow(samples)), size = floor(0.8 * nrow(samples)))
+training <- samples[train_rows, ]
+testing <- samples[-train_rows, ]
+```
+
+## Fit one Random Forest
+
+A decision tree repeatedly splits observations using predictor thresholds. For example, a split might divide observations according to near-infrared reflectance. Further splits can use other bands to distinguish the classes.
+
+A Random Forest combines many trees. Each tree is trained using a random sample of observations, and each split considers a random subset of predictor bands. For classification, the trees vote for a class. Combining their votes reduces the influence of any single tree. [Breiman, 2001](https://doi.org/10.1023/A:1010933404324)
+
+Here, `num.trees = 500` sets the number of trees we grow. `min.node.size = 10` sets the minimum node size at which further splitting is considered. `num.threads` controls the number of CPU threads. The formula `SSP_CH ~ .` uses all other columns in the training table to predict the class. [ranger documentation](https://imbs-hl.github.io/ranger/reference/ranger.html)
+
+```{r}
+rf <- ranger(
+  SSP_CH ~ ., data = training, num.trees = 500,
+  min.node.size = 10, num.threads = threads, seed = 333
+)
+```
+
+```{r}
+test_prediction <- predict(rf, data = testing[, bands])$predictions
+confusion <- table(observed = testing$SSP_CH, predicted = test_prediction)
+confusion
+```
+
+```{r}
+test_statistics <- data.frame(
+  overall_accuracy_pct = round(100 * sum(diag(confusion)) / sum(confusion), 1),
+  balanced_accuracy_pct = round(100 * mean(diag(confusion) / rowSums(confusion)), 1)
+)
+test_statistics
+```
+
+## Read the test results
+
+The confusion matrix compares predictions with the labels of the reserved test points. Each row is an observed class and each column is a predicted class. The diagonal contains correct predictions. Off-diagonal entries show which classes the model confuses.
+
+Overall accuracy gives the fraction of test observations classified correctly. For a confusion matrix $C$,
+
+$$\text{OA} = \frac{\sum\limits_{k}C_{kk}}{\sum\limits_{i}\sum\limits_{j}C_{ij}}.$$
+
+Recall for class $k$ is the fraction of its reference observations recovered correctly. Balanced accuracy gives every class the same weight by averaging those recalls,
+
+$$\text{Recall}_{k} = \frac{C_{kk}}{\sum\limits_{j}C_{kj}},\qquad\text{BA} = \frac{1}{K}\sum\limits_{k = 1}^{K}\text{Recall}_{k}.$$
+
+For example, if 35 of 50 reference forest points are predicted as forest, forest recall is 70%. Overall accuracy can be dominated by classes with many test observations. Balanced accuracy helps reveal whether performance is uneven across classes.
+
+The scores refer to this reference sample and random split. The stratified sampling design influences the contribution of each class, so overall accuracy here does not directly estimate the fraction of Switzerland's area mapped correctly. Nearby training and test points may also share similar conditions. Spatially separated testing would examine performance under a more demanding form of transfer. [Roberts et al., 2017](https://doi.org/10.1111/ecog.02881)
+
+## Predict the full extent, then inspect Zurich
+
+The fitted forest now assigns a class to every cell with complete predictors in the full 2025 raster. `terra::predict()` writes that result to a GeoTIFF. The small wrapper converts the factor predictions back to their original numeric class codes. We then crop the completed classification to Zurich and apply the JSON colours.
+
+```{r}
+predict_class <- function(model, data) {
+  as.integer(as.character(predict(model, data = data, num.threads = threads)$predictions))
+}
+
+# Predict the full 2025 raster first.
+prediction_2025 <- terra::predict(
+  image_2025, rf, fun = predict_class, na.rm = TRUE,
+  filename = file.path(data_dir, "landcover_RF_SSPCH_2025.tif"),
+  overwrite = TRUE, wopt = list(datatype = "INT1U")
+)
+```
+
+```{r}
+# Then crop and plot Zurich.
+prediction_zurich <- crop(prediction_2025, zurich_satellite, mask = TRUE)
+rf_palette <- palette[palette$class_value %in% levels(samples$SSP_CH), ]
+levels(prediction_zurich) <- rf_palette[, c("class_value", "class_name")]
+plot(prediction_zurich, col = rf_palette$colour, type = "classes",
+     axes = FALSE, main = "Random Forest — Zurich, 2025",
+     plg = list(cex = 0.75))
+```
+
+The classifier can only assign classes represented in its training labels. Including lake and river reference points lets it learn water signatures alongside the land classes. Shrubland remains absent because the available reference aggregation cannot isolate it. Inspect both errors among learned classes and the effect of this incomplete legend.
+
+The map also describes 2025 only. Evaluating change between 2018 and 2025 would require evaluating classification performance for both dates and investigating the uncertainty of apparent transitions, but that is currently beyond the scope of this exercise.
+
+# 3. Explore possible future landscapes
+
+## Introduce scenario assumptions
+
+Satellite observations describe conditions at the time of observation. To explore future land use, we need assumptions about the processes that could change it.
+
+The SSP-CH maps used here come from the Evoland land-use model. It distributes land-use change across a 100 m grid using scenario-specific class demands and spatial restrictions. These restrictions include environmental conditions, infrastructure and regional constraints. [SSP-CH land-use methods](https://ssp-ch-szenarien.wsl.ch/en/land-use-and-land-use-change-in-the-ssp-ch/)
+
+Here we compare SSP0, described as a frugal Switzerland, with SSP5, described as a resource-intensive Switzerland. Their 2080 maps represent outcomes under different socioeconomic assumptions. The 2025 scenario maps are model states and can differ from the Random Forest's interpretation of the satellite image. The classifier's test accuracy applies to its 2025 predictions. Evaluating the scenario model calls for evidence about its assumptions and modelling process. [SSP-CH scenarios](https://ssp-ch-szenarien.wsl.ch/en/land-use-and-land-use-change-in-the-ssp-ch/) · [Scenario dataset](https://zenodo.org/records/17108008)
+
+```{r}
+scenario_dir <- file.path(data_dir, "NCCS-SSP-results", "raster_data")
+ssp0_2025 <- rast(file.path(scenario_dir, "SSP0", "SSP0-2025.tif"))
+ssp0_2080 <- rast(file.path(scenario_dir, "SSP0", "SSP0-2080.tif"))
+ssp5_2025 <- rast(file.path(scenario_dir, "SSP5", "SSP5-2025.tif"))
+ssp5_2080 <- rast(file.path(scenario_dir, "SSP5", "SSP5-2080.tif"))
+
+scenario_maps <- c(ssp0_2025, ssp0_2080, ssp5_2025, ssp5_2080)
+names(scenario_maps) <- c("SSP0 — 2025", "SSP0 — 2080", "SSP5 — 2025", "SSP5 — 2080")
+zurich_scenarios <- project(zurich, crs(scenario_maps))
+scenarios_zurich <- crop(scenario_maps, zurich_scenarios, mask = TRUE)
+levels(scenarios_zurich) <- rep(list(palette[, c("class_value", "class_name")]), 4)
+
+plot(scenarios_zurich, nr = 2, nc = 2, col = palette$colour,
+     type = "classes", axes = FALSE,
+     main = c("SSP0 — 2025", "SSP0 — 2080", "SSP5 — 2025", "SSP5 — 2080"),
+     plg = list(cex = 0.65))
+```
+
+Each row shows one scenario. The left column shows 2025 and the right column shows 2080. The same JSON legend is used throughout.
+
+Inspect where the scenarios place settlement, agriculture and forest. Look for both the amount of each class and the spatial configuration of its patches. Similar class totals can coexist with different arrangements in the landscape.
+
+## Quantify the difference between scenarios in 2080
+
+Maps reveal location and configuration. A class-area comparison makes the magnitude of the difference easier to assess.
+
+For each class, we count the cells in each 2080 map and multiply by 0.01 km², the nominal area of a 100 m × 100 m grid cell. Only cells with values in both maps enter the comparison. These are grid-based area estimates, including the rasterised canton boundary.
+
+The final plot shows
+
+$$D_{k} = A_{k,\,\text{SSP5},\, 2080} - A_{k,\,\text{SSP0},\, 2080}.$$
+
+A positive value means that a class occupies more area in SSP5 in 2080. A negative value means that it occupies more area in SSP0. This compares the two future endpoints. To calculate change through time within a scenario, compare its 2080 map with its own 2025 map.
+
+```{r}
+cover_2080 <- values(scenarios_zurich[[c(2, 4)]])
+cover_2080 <- na.omit(cover_2080)
+
+area_ssp0 <- table(factor(cover_2080[, 1], levels = palette$class_value)) * 0.01
+area_ssp5 <- table(factor(cover_2080[, 2], levels = palette$class_value)) * 0.01
+difference_km2 <- as.numeric(area_ssp5 - area_ssp0)
+
+par(mar = c(4, 11, 3, 1))
+barplot(rev(difference_km2), names.arg = rev(palette$class_name),
+        horiz = TRUE, las = 1, col = rev(palette$colour),
+        border = NA, cex.names = 0.85,
+        xlab = "Area difference in 2080 (SSP5 minus SSP0), km²",
+        main = "How do the 2080 scenarios differ in Zurich?")
+abline(v = 0, lty = 2)
+```
+
+```{r}
+par(mar = c(5, 4, 4, 2) + 0.1)
+```
+
+## Data attribution
+
+The Zurich polygon is derived from swisstopo's cantonal boundaries. The satellite composites and reference sample were prepared for this course. The scenario rasters, class values and colours are from Black, Gubler and Kemmler's NCCS SSP-CH results, released under CC BY 4.0. [Cantonal boundaries](https://www.swisstopo.admin.ch/en/landscape-model-swissboundaries3d) · [NCCS scenario data and citation](https://zenodo.org/records/17108008)

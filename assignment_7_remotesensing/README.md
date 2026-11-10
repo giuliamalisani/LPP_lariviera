@@ -16,6 +16,10 @@ prediction outputs for the Bregaglia land-cover Random Forest assignment.
 - `bregaglia_rf_experiments.R` — temporal and neighbourhood-context feature
   experiments.
 - `bregaglia_rf_dem_experiment.R` — isolated DEM feature experiment.
+- `practical_7_original.Rmd` — original national ten-band baseline used to
+  distinguish the starting workflow from the Bregaglia extensions.
+- `ssp1_rf_agreement.R` — compares the national and local 2025 Random Forest
+  maps with SSP1-2025 as a cross-model consistency check.
 
 ## Principal results
 
@@ -49,6 +53,17 @@ class in the six-class legend.
 - `confusion_fine_9class.csv`
 - `confusion_posthoc_6class.csv`
 - `confusion_retrained_6class.csv`
+- `results/ssp1_2025_rf_agreement_summary.csv`
+- `results/ssp1_2025_rf_agreement_by_class.csv`
+
+## Report material
+
+- `Chapter_2.tex` — LaTeX chapter with model provenance, validation results,
+  thematic aggregation tests, and SSP1-2025 consistency analysis.
+- `report_draft.pdf` — current report draft.
+- `figures/` — classification and agreement figures.
+- `render_chapter2_map.R` and `render_ssp1_agreement_charts.R` — scripts used
+  to reproduce the figures from the stored rasters and result tables.
 
 ## Software
 

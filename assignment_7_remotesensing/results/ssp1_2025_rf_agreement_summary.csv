@@ -1,0 +1,3 @@
+"model","n_compared_cells","overall_agreement_pct","balanced_agreement_pct","macro_iou_pct","cohen_kappa","ssp1_cells_in_unsupported_classes_pct","agreement_within_supported_ssp1_classes_pct"
+"Original national RF output",33905,51.0426190827312,36.7555567313963,20.029315431614,0.388778069159816,15.6289632797522,60.4977976648256
+"Local terrain RF output",33905,54.8739124023005,40.0882250294993,22.3810413159284,0.42922515169177,15.6643562896328,65.0660977827516
